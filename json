@@ -1,9 +1,16 @@
 {
   "patient_id": "patient_001",
+  "timestamp": 1635724800000,
   "vitals": {
     "heart_rate_bpm": 72,
     "spo2": 98,
     "body_temp_c": 36.6,
     "ecg_raw": 512
+  },
+  "activity": {
+    "accel_x": 0.12,
+    "accel_y": -0.08,
+    "accel_z": 1.02,
+    "fall_detected": false
   }
 }
