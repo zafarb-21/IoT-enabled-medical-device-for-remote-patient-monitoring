@@ -1,0 +1,13 @@
+ESP32      MAX30102/MAX32664    MLX90614    AD8232       MPU6050
+-----      --------------       --------    ------       -------
+3.3V  ---> VIN                  VIN         3.3V         VCC
+GND   ---> GND                  GND         GND          GND
+SDA   ---> SDA                  SDA                        SDA (GPIO 21)
+SCL   ---> SCL                  SCL                        SCL (GPIO 22)
+      ---> RES_PIN (GPIO 12)
+      ---> MFIO_PIN (GPIO 13)
+
+AD8232 Specific:
+GPIO 34  --> OUTPUT (ECG Signal)
+GPIO 36  --> LO+
+GPIO 39  --> LO-
