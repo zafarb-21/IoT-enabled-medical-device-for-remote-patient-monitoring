@@ -2,7 +2,7 @@
 
 A graduate-level project demonstrating the integration of embedded systems and computer networks for affordable, scalable remote patient monitoring using ESP32 and IoT technologies.
 
-## 📋 Project Overview
+## Project Overview
 
 This system autonomously collects multiple physiological parameters from a patient, securely transmits the data over Wi-Fi using MQTT protocol, and displays real-time vitals on a cloud-based dashboard for remote clinical oversight.
 
@@ -14,7 +14,7 @@ This system autonomously collects multiple physiological parameters from a patie
 - **Low-Cost Design**: Total hardware cost under $50
 - **Power Efficient**: Deep sleep capabilities for extended battery life
 
-## 🛠 Hardware Components
+## Hardware Components
 
 | Component | Purpose | Cost (Approx.) |
 |-----------|---------|----------------|
@@ -28,7 +28,7 @@ This system autonomously collects multiple physiological parameters from a patie
 
 **Total Estimated Cost: ~$50**
 
-## 📦 Software Requirements
+## Software Requirements
 
 ### Arduino IDE Libraries
 ```cpp
