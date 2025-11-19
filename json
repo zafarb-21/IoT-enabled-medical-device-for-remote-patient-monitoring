@@ -1,0 +1,9 @@
+{
+  "patient_id": "patient_001",
+  "vitals": {
+    "heart_rate_bpm": 72,
+    "spo2": 98,
+    "body_temp_c": 36.6,
+    "ecg_raw": 512
+  }
+}
