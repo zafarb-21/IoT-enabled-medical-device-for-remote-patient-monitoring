@@ -1,0 +1,3 @@
+Sensors → ESP32 → MQTT (Wi-Fi) → Mosquitto Broker → Node-RED → InfluxDB → Grafana Dashboard
+                    ↑                    ↑               ↑
+                TLS Encryption    Data Processing    Alert Generation
