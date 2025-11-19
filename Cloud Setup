@@ -1,0 +1,18 @@
+# On your cloud VM, install the software stack:
+sudo apt update
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
+
+# Install Node-RED
+bash <(curl -sL https://raw.githubusercontent.com/node-red/linux-installers/master/deb/update-nodejs-and-nodered)
+sudo systemctl enable nodered
+
+# Install InfluxDB
+wget -q https://repos.influxdata.com/influxdata-archive.key
+sudo apt-get install influxdb2
+sudo systemctl enable influxdb
+
+# Install Grafana
+wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -
+sudo apt-get install grafana
+sudo systemctl enable grafana-server
