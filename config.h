@@ -17,3 +17,6 @@
 #define MIN_HEART_RATE 40
 #define MAX_TEMPERATURE 38.5  // °C
 #define MIN_SPO2 90           // %
+
+// Debug settings
+#define DEBUG_LEVEL 2  // 0=Off, 1=Minimal, 2=Detailed
