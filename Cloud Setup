@@ -1,4 +1,4 @@
-# On your cloud VM, install the software stack:
+# On cloud VM, install the software stack:
 sudo apt update
 sudo apt install mosquitto mosquitto-clients
 sudo systemctl enable mosquitto
