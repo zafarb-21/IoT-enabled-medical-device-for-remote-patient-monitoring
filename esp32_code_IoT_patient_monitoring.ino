@@ -24,14 +24,6 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 // ========== GLOBAL VARIABLES ==========
-// Heart rate calculation
-const byte RATE_SIZE = 4;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-float beatsPerMinute;
-int beatAvg;
-
 // Sensor data structure
 struct SensorData {
   int heartRate;
@@ -233,35 +225,10 @@ bool initializeSensors() {
 SensorData readAllSensors() {
   SensorData data;
   
-  // Read MAX30102 for heart rate using IR
-  long irValue = particleSensor.getIR();
-  
-  if (checkForBeat(irValue) == true) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    beatsPerMinute = 60 / (delta / 1000.0);
-    
-    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-      rates[rateSpot++] = (byte)beatsPerMinute;
-      rateSpot %= RATE_SIZE;
-      
-      // Calculate average heart rate
-      beatAvg = 0;
-      for (byte x = 0 ; x < RATE_SIZE ; x++)
-        beatAvg += rates[x];
-      beatAvg /= RATE_SIZE;
-    }
-  }
-  data.heartRate = beatAvg;
-  
-  // Read Bio Sensor Hub for SpO2 and alternative BPM
-  bioData body; 
-  body = bioHub.readBpm();
-  data.spo2 = body.oxygen;
-  // Use Bio Hub heart rate if MAX30102 reading is invalid
-  if (data.heartRate == 0) {
-    data.heartRate = body.heartRate;
-  }
+  // === OPTION A: Use Bio Sensor Hub for BOTH Heart Rate and SpO2 ===
+  bioData body = bioHub.readBpm();
+  data.heartRate = body.heartRate;  // Heart rate from Bio Hub
+  data.spo2 = body.oxygen;          // SpO2 from Bio Hub
   
   // Read MLX90614 temperature
   data.temperature = mlx.readObjectTempC();
@@ -436,7 +403,7 @@ bool reconnectMQTT() {
 
 // ========== UTILITY FUNCTIONS ==========
 void checkPowerSource() {
-  // Simplified check - in real implementation, use proper power monitoring
+  // Simplified check - in real implementation, proper power monitoring is used
   isBatteryPower = false; // Assume mains power for prototype
 }
 
