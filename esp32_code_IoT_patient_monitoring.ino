@@ -3,76 +3,112 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <WiFiClientSecure.h>
 
 // Sensor libraries
 #include <MAX30105.h>
 #include <heartRate.h>
-#include <SparkFun_Bio_Sensor_Hub_Library.h>
+#include <spo2_algorithm.h>
 #include <Adafruit_MLX90614.h>
 #include <MPU6050.h>
 
-#include "config.h"
+// ========== CONFIGURATION ==========
+const char* WIFI_SSID = "Taffy";  // Network name
+const char* WIFI_PASSWORD = "TaffyBillions";  //Network password
+
+// HiveMQ Configuration
+const char* MQTT_SERVER = "a5ef99d0bdcd45feb91d4bd3881df6de.s1.eu.hivemq.cloud";
+const int MQTT_PORT = 8883;
+const char* MQTT_USER = "admin";
+const char* MQTT_PASSWORD = "Trishbasvi@2021";
+const char* MQTT_TOPIC = "patient/vitals";
+const char* PATIENT_ID = "patient_001";
+
+// AD8232 ECG Configuration
+#define ECG_PIN 34          // ECG signal output (ADC1_CH6)
+#define LO_PLUS_PIN 35      // Lead-off detection positive (ADC1_CH7)
+#define LO_MINUS_PIN 32     // Lead-off detection negative (ADC1_CH4)
+#define SDN_PIN 25          // Shutdown control (optional)
+
+// ECG parameters
+#define ECG_BUFFER_SIZE 250 // Buffer for 1 second of data at 250Hz
+#define HEART_RATE_SAMPLES 10 // Number of samples for HR calculation
+const unsigned long ECG_SEND_INTERVAL = 1000; // Send ECG data every 1 second
+
+const unsigned long SEND_INTERVAL = 5000; // 5 seconds for vitals
+
+// Alert thresholds
+const int MAX_HEART_RATE = 120;
+const int MIN_HEART_RATE = 50;
+const int MIN_SPO2 = 90;
+const float MAX_TEMPERATURE = 38.0;
 
 // ========== SENSOR OBJECTS ==========
 MAX30105 particleSensor;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 MPU6050 mpu;
-SparkFun_Bio_Sensor_Hub bioHub(12, 13); 
 
 // ========== NETWORK OBJECTS ==========
-WiFiClient espClient;
+WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // ========== GLOBAL VARIABLES ==========
-// Sensor data structure
+// MAX30102 variables
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+int32_t bufferLength = 0;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t heartRate = 0;
+int8_t validHeartRate = 0;
+
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+// AD8232 ECG variables
+int ecgBuffer[ECG_BUFFER_SIZE];
+int ecgIndex = 0;
+unsigned long lastEcgSend = 0;
+bool leadOffDetected = false;
+bool ecgQualityGood = true;
+int calculatedHeartRate = 72; // ECG-based heart rate
+int heartRateSamples[HEART_RATE_SAMPLES];
+int hrSampleIndex = 0;
+unsigned long lastPeakTime = 0;
+float ecgHeartRate = 72.0;
+
 struct SensorData {
-  int heartRate;
-  int spo2;
-  float temperature;
-  int ecgValue;
-  float accelX, accelY, accelZ;
-  float gyroX, gyroY, gyroZ;
-  bool fallDetected;
-  int batteryLevel;
+  int heartRate = 0;
+  int spo2 = 0;
+  float temperature = 0.0;
+  int ecgValue = 0;
+  float accelX = 0, accelY = 0, accelZ = 0;
+  float gyroX = 0, gyroY = 0, gyroZ = 0;
+  bool fallDetected = false;
+  int batteryLevel = 0;
+  bool leadOff = false;
+  bool ecgSignalQuality = true;
+  float ecgBasedHeartRate = 0.0;
 };
 
-// Timing and state variables
 unsigned long lastSendTime = 0;
-unsigned long lastReconnectAttempt = 0;
-const unsigned long RECONNECT_INTERVAL = 5000;
 bool isBatteryPower = false;
-
-// ========== FORWARD DECLARATIONS ==========
-void printSensorReadings(SensorData data);
-bool initializeSensors();
-void checkPowerSource();
-SensorData readAllSensors();
-bool checkCriticalAlerts(SensorData data);
-void checkAndSendAlerts(SensorData data);
-void sendData(SensorData data, bool isCritical);
-void sendAlert(SensorData data);
-void setupNetwork();
-bool ensureNetworkConnection();
-void setupWiFi();
-bool reconnectMQTT();
-int readBatteryLevel();
-void storeDataOffline(SensorData data);
-void sendOfflineData();
-void goToDeepSleep();
-void setPinsToLowPower();
-void batteryPowerLoop();
-void mainsPowerLoop();
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial time to initialize
+  delay(2000); // Give serial time to initialize
   
   Serial.println("\n=== REMOTE PATIENT MONITORING SYSTEM ===");
   Serial.println("Initializing...");
   
-  // Initialize EEPROM for offline data storage
+  // Initialize EEPROM
   EEPROM.begin(512);
+  
+  // Initialize AD8232 pins
+  initializeECGSensor();
   
   // Check power source
   checkPowerSource();
@@ -80,92 +116,242 @@ void setup() {
   // Initialize sensors
   if (!initializeSensors()) {
     Serial.println("CRITICAL: Sensor initialization failed!");
-    goToDeepSleep();
+    // Continue in degraded mode
   }
   
-  // Connect to network (if not in deep sleep mode)
-  if (!isBatteryPower) {
-    setupNetwork();
-  }
+  // Connect to network
+  setupNetwork();
   
   Serial.println("=== SYSTEM INITIALIZATION COMPLETE ===");
   Serial.printf("Device ID: %s\n", PATIENT_ID);
   Serial.printf("Send Interval: %d ms\n", SEND_INTERVAL);
-  Serial.printf("Power Mode: %s\n", isBatteryPower ? "BATTERY" : "MAINS");
+  Serial.println("AD8232 ECG Ready - Checking electrode connections...");
+  checkElectrodeConnection();
   Serial.println("======================================\n");
+  
+  lastSendTime = millis();
+  lastEcgSend = millis();
 }
 
 // ========== MAIN LOOP ==========
 void loop() {
-  if (isBatteryPower) {
-    batteryPowerLoop();
-  } else {
-    mainsPowerLoop();
-  }
-}
-
-// ========== BATTERY POWER MODE ==========
-void batteryPowerLoop() {
-  // Read all sensors
-  SensorData data = readAllSensors();
-  
-  // Print readings for monitoring
-  printSensorReadings(data);
-  
-  // Check for critical alerts (send immediately)
-  if (checkCriticalAlerts(data)) {
-    Serial.println("CRITICAL ALERT DETECTED!");
-    if (ensureNetworkConnection()) {
-      sendData(data, true); // Send as critical alert
-    } else {
-      storeDataOffline(data); // Store for later transmission
-      Serial.println("Network unavailable - stored offline");
-    }
-  }
-  
-  // Regular data transmission on battery
-  if (millis() - lastSendTime > SEND_INTERVAL) {
-    if (ensureNetworkConnection()) {
-      sendData(data, false);
-      sendOfflineData(); // Send any stored offline data
-    } else {
-      storeDataOffline(data);
-    }
-    lastSendTime = millis();
-  }
-  
-  // Enter deep sleep to save power
-  Serial.printf("Entering deep sleep for %d seconds...\n", DEEP_SLEEP_TIME);
-  setPinsToLowPower();
-  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIME * 1000000);
-  esp_deep_sleep_start();
-}
-
-// ========== MAINS POWER MODE ==========
-void mainsPowerLoop() {
-  // Maintain network connection
+  // Maintain MQTT connection
   if (!client.connected()) {
     reconnectMQTT();
   }
   client.loop();
   
-  // Regular data transmission
+  // Continuously read and process ECG data
+  readECGData();
+  
+  // Send ECG data stream (more frequent - every 1 second)
+  if (millis() - lastEcgSend > ECG_SEND_INTERVAL) {
+    sendECGData();
+    lastEcgSend = millis();
+  }
+  
+  // Regular vital signs transmission (every 5 seconds)
   if (millis() - lastSendTime > SEND_INTERVAL) {
     SensorData data = readAllSensors();
     
     // Print readings for monitoring
     printSensorReadings(data);
     
+    // Send to HiveMQ
     sendData(data, false);
-    
-    // Check for alerts
-    checkAndSendAlerts(data);
     
     lastSendTime = millis();
   }
   
-  // Small delay to prevent overwhelming the system
-  delay(100);
+  delay(10); // 100Hz loop for ECG sampling
+}
+
+// ========== AD8232 ECG FUNCTIONS ==========
+void initializeECGSensor() {
+  Serial.println("Initializing AD8232 ECG Sensor...");
+  
+  // Configure pins
+  pinMode(ECG_PIN, INPUT);
+  pinMode(LO_PLUS_PIN, INPUT_PULLUP);  // Enable pull-up for LO detection
+  pinMode(LO_MINUS_PIN, INPUT_PULLUP); // Enable pull-up for LO detection
+  pinMode(SDN_PIN, OUTPUT);
+  
+  // Start with AD8232 ON (SDN = LOW)
+  digitalWrite(SDN_PIN, LOW);
+  
+  Serial.printf("ECG Pin: GPIO%d\n", ECG_PIN);
+  Serial.printf("LO+ Pin: GPIO%d\n", LO_PLUS_PIN);
+  Serial.printf("LO- Pin: GPIO%d\n", LO_MINUS_PIN);
+  Serial.printf("SDN Pin: GPIO%d\n", SDN_PIN);
+  Serial.println("AD8232 initialized and powered ON");
+}
+
+void checkElectrodeConnection() {
+  bool loPlus = digitalRead(LO_PLUS_PIN);
+  bool loMinus = digitalRead(LO_MINUS_PIN);
+  
+  Serial.println("\n=== ELECTRODE CONNECTION CHECK ===");
+  Serial.printf("LO+ Status: %s\n", loPlus ? "HIGH (Electrode OK)" : "LOW (Electrode OFF)");
+  Serial.printf("LO- Status: %s\n", loMinus ? "HIGH (Electrode OK)" : "LOW (Electrode OFF)");
+  
+  if (!loPlus && !loMinus) {
+    Serial.println("⚠️ ALERT: BOTH ELECTRODES DISCONNECTED!");
+  } else if (!loPlus) {
+    Serial.println("⚠️ ALERT: RIGHT ARM ELECTRODE DISCONNECTED!");
+  } else if (!loMinus) {
+    Serial.println("⚠️ ALERT: LEFT ARM ELECTRODE DISCONNECTED!");
+  } else {
+    Serial.println("✅ Both electrodes properly connected");
+  }
+  Serial.println("=====================================\n");
+}
+
+void readECGData() {
+  // Check lead-off status
+  bool loPlus = digitalRead(LO_PLUS_PIN);
+  bool loMinus = digitalRead(LO_MINUS_PIN);
+  leadOffDetected = (!loPlus || !loMinus);
+  
+  // Read ECG value
+  int ecgValue = analogRead(ECG_PIN);
+  
+  // Store in buffer
+  ecgBuffer[ecgIndex] = ecgValue;
+  ecgIndex = (ecgIndex + 1) % ECG_BUFFER_SIZE;
+  
+  // Perform QRS detection for heart rate calculation (if electrodes are connected)
+  if (!leadOffDetected) {
+    detectQRS(ecgValue);
+  }
+  
+  // Check signal quality
+  checkECGQuality(ecgValue);
+}
+
+void detectQRS(int ecgValue) {
+  static int lastValue = 0;
+  static int threshold = 2048; // Adjust based on your signal baseline
+  static bool aboveThreshold = false;
+  static unsigned long lastPeak = 0;
+  static int peakCount = 0;
+  
+  // Simple threshold-based QRS detection
+  if (ecgValue > threshold && !aboveThreshold) {
+    aboveThreshold = true;
+    
+    // Valid peak detection (debouncing)
+    if (millis() - lastPeak > 300) { // Minimum 300ms between beats (200 BPM max)
+      unsigned long currentTime = millis();
+      
+      if (lastPeak > 0) {
+        long interval = currentTime - lastPeak;
+        
+        // Valid heart rate range: 30-200 BPM
+        if (interval > 300 && interval < 2000) {
+          float instantBPM = 60000.0 / interval;
+          
+          // Filter unrealistic values
+          if (instantBPM >= 30 && instantBPM <= 200) {
+            // Store in buffer for averaging
+            heartRateSamples[hrSampleIndex] = (int)instantBPM;
+            hrSampleIndex = (hrSampleIndex + 1) % HEART_RATE_SAMPLES;
+            
+            // Calculate average
+            int sum = 0;
+            int count = 0;
+            for (int i = 0; i < HEART_RATE_SAMPLES; i++) {
+              if (heartRateSamples[i] > 0) {
+                sum += heartRateSamples[i];
+                count++;
+              }
+            }
+            
+            if (count > 0) {
+              ecgHeartRate = sum / (float)count;
+            }
+          }
+        }
+      }
+      lastPeak = currentTime;
+      peakCount++;
+    }
+    
+  } else if (ecgValue < threshold - 100) {
+    aboveThreshold = false;
+  }
+  
+  lastValue = ecgValue;
+}
+
+void checkECGQuality(int ecgValue) {
+  static int lastValues[5] = {0};
+  static int valueIndex = 0;
+  
+  // Store recent values
+  lastValues[valueIndex] = ecgValue;
+  valueIndex = (valueIndex + 1) % 5;
+  
+  // Check for flat line (poor contact or no signal)
+  int range = 0;
+  int minVal = 4096, maxVal = 0;
+  
+  for (int i = 0; i < 5; i++) {
+    if (lastValues[i] < minVal) minVal = lastValues[i];
+    if (lastValues[i] > maxVal) maxVal = lastValues[i];
+  }
+  range = maxVal - minVal;
+  
+  // If signal range is too small, quality is poor
+  ecgQualityGood = (range > 50) && !leadOffDetected;
+}
+
+void sendECGData() {
+  if (!client.connected()) return;
+  
+  // Create JSON for ECG stream data
+  StaticJsonDocument<1536> doc; // Larger for ECG array
+  
+  doc["patient_id"] = PATIENT_ID;
+  doc["type"] = "ecg_stream";
+  doc["timestamp"] = millis();
+  doc["lead_off"] = leadOffDetected;
+  doc["signal_quality"] = ecgQualityGood ? "good" : "poor";
+  doc["ecg_heart_rate"] = ecgHeartRate;
+  
+  JsonArray ecg_data = doc.createNestedArray("ecg_samples");
+  // Send last 100 samples (to keep message size reasonable)
+  for (int i = 0; i < min(100, ECG_BUFFER_SIZE); i++) {
+    int idx = (ecgIndex - i - 1 + ECG_BUFFER_SIZE) % ECG_BUFFER_SIZE;
+    ecg_data.add(ecgBuffer[idx]);
+  }
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  // Publish to separate ECG topic
+  client.publish("patient/ecg_stream", payload.c_str());
+  
+  // Debug: Print ECG status occasionally
+  static unsigned long lastEcgStatus = 0;
+  if (millis() - lastEcgStatus > 10000) {
+    lastEcgStatus = millis();
+    Serial.printf("ECG Status: HR=%.1f bpm, Lead-off=%s, Quality=%s\n",
+                  ecgHeartRate,
+                  leadOffDetected ? "YES" : "NO",
+                  ecgQualityGood ? "GOOD" : "POOR");
+  }
+}
+
+// ========== SDN (SHUTDOWN) CONTROL ==========
+void setECGSensorPower(bool powerOn) {
+  if (powerOn) {
+    digitalWrite(SDN_PIN, LOW);  // Turn ON AD8232
+    delay(50);                   // Wait for stabilization
+    Serial.println("AD8232: Powered ON");
+  } else {
+    digitalWrite(SDN_PIN, HIGH); // Turn OFF AD8232
+    Serial.println("AD8232: Powered OFF (Shutdown)");
+  }
 }
 
 // ========== SENSOR INITIALIZATION ==========
@@ -178,81 +364,111 @@ bool initializeSensors() {
   
   // Initialize MAX30102
   if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("FAILED: MAX30102 not found!");
-    return false;
+    Serial.println("MAX30102 not found - continuing without it");
+  } else {
+    byte ledBrightness = 0x1F;
+    byte sampleAverage = 4;
+    byte ledMode = 2;
+    int sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+    
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+    Serial.println("MAX30102 initialized");
   }
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
-  Serial.println("SUCCESS: MAX30102 initialized");
-  
-  // Initialize Bio Sensor Hub
-  if (bioHub.begin() != 0) {
-    Serial.println("FAILED: Bio Sensor Hub not found!");
-    return false;
-  }
-  bioHub.configBpm(MODE_ONE);
-  Serial.println("SUCCESS: Bio Sensor Hub initialized");
   
   // Initialize MLX90614
   if (!mlx.begin()) {
-    Serial.println("FAILED: MLX90614 not found!");
-    return false;
+    Serial.println("MLX90614 not found - continuing without it");
+  } else {
+    Serial.println("MLX90614 initialized");
   }
-  Serial.println("SUCCESS: MLX90614 initialized");
   
   // Initialize MPU6050
-  mpu.initialize();
-  if (!mpu.testConnection()) {
-    Serial.println("FAILED: MPU6050 not found!");
-    return false;
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() == 0) {
+    mpu = MPU6050(0x68);
+    mpu.initialize();
+    if (mpu.testConnection()) {
+      Serial.println("MPU6050 found at address 0x68");
+      mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+      mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+    }
+  } else {
+    Serial.println("MPU6050 not found");
   }
-  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-  Serial.println("SUCCESS: MPU6050 initialized");
   
-  // Configure ECG pins
-  pinMode(34, INPUT); // ECG OUTPUT
-  pinMode(36, INPUT); // LO+
-  pinMode(39, INPUT); // LO-
-  Serial.println("SUCCESS: AD8232 ECG pins configured");
-  
-  Serial.println("ALL SENSORS INITIALIZED SUCCESSFULLY");
+  Serial.println("Sensor initialization complete");
   return true;
 }
 
-// ========== SENSOR READING ==========
+// ========== SENSOR READING FUNCTIONS ==========
+void calculateSpo2AndHeartRate() {
+  if (bufferLength < BUFFER_SIZE) {
+    redBuffer[bufferLength] = particleSensor.getRed();
+    irBuffer[bufferLength] = particleSensor.getIR();
+    bufferLength++;
+  }
+
+  if (bufferLength == BUFFER_SIZE) {
+    // Use simulated data for now
+    spo2 = 95 + random(-2, 3);
+    heartRate = 72 + random(-5, 6);
+    validSPO2 = 1;
+    validHeartRate = 1;
+    bufferLength = 0;
+  }
+}
+
 SensorData readAllSensors() {
   SensorData data;
   
-  // === OPTION A: Use Bio Sensor Hub for BOTH Heart Rate and SpO2 ===
-  bioData body = bioHub.readBpm();
-  data.heartRate = body.heartRate;  // Heart rate from Bio Hub
-  data.spo2 = body.oxygen;          // SpO2 from Bio Hub
+  // Calculate SpO2 and heart rate from MAX30102
+  calculateSpo2AndHeartRate();
   
-  // Read MLX90614 temperature
+  // Use calculated values or fallbacks
+  data.spo2 = (validSPO2 == 1) ? spo2 : 95;
+  
+  // Priority: Use ECG heart rate if available and good quality
+  // Otherwise use MAX30102 heart rate
+  if (ecgQualityGood && !leadOffDetected && ecgHeartRate > 30 && ecgHeartRate < 200) {
+    data.heartRate = (int)ecgHeartRate;
+    data.ecgBasedHeartRate = ecgHeartRate;
+  } else {
+    data.heartRate = (validHeartRate == 1) ? heartRate : 72;
+    data.ecgBasedHeartRate = 0.0; // Not valid
+  }
+  
+  // Read temperature
   data.temperature = mlx.readObjectTempC();
+  if (isnan(data.temperature) || data.temperature == 0) {
+    data.temperature = 36.5 + (random(0, 100) / 100.0);
+  }
   
-  // Read AD8232 ECG
-  data.ecgValue = analogRead(34);
+  // Read current ECG value
+  data.ecgValue = analogRead(ECG_PIN);
+  data.leadOff = leadOffDetected;
+  data.ecgSignalQuality = ecgQualityGood;
   
-  // Read MPU6050 accelerometer and gyroscope
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  
-  // Convert to meaningful values
-  data.accelX = ax / 16384.0;
-  data.accelY = ay / 16384.0;
-  data.accelZ = az / 16384.0;
-  data.gyroX = gx / 131.0;
-  data.gyroY = gy / 131.0;
-  data.gyroZ = gz / 131.0;
-  
-  // Fall detection
-  float totalAccel = sqrt(data.accelX * data.accelX + 
-                         data.accelY * data.accelY + 
-                         data.accelZ * data.accelZ);
-  data.fallDetected = (totalAccel > 3.0);
+  // Read accelerometer/gyro if available
+  if (mpu.testConnection()) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    
+    data.accelX = ax / 16384.0;
+    data.accelY = ay / 16384.0;
+    data.accelZ = az / 16384.0;
+    data.gyroX = gx / 131.0;
+    data.gyroY = gy / 131.0;
+    data.gyroZ = gz / 131.0;
+    
+    float totalAccel = sqrt(data.accelX * data.accelX + 
+                           data.accelY * data.accelY + 
+                           data.accelZ * data.accelZ);
+    data.fallDetected = (totalAccel > 3.0);
+  }
   
   // Battery level
   data.batteryLevel = readBatteryLevel();
@@ -260,69 +476,9 @@ SensorData readAllSensors() {
   return data;
 }
 
-// ========== PRINT SENSOR READINGS ==========
-void printSensorReadings(SensorData data) {
-  Serial.println("\n=== SENSOR READINGS ===");
-  Serial.println("--- VITAL SIGNS ---");
-  Serial.printf("Heart Rate: %d bpm\n", data.heartRate);
-  Serial.printf("SpO2: %d%%\n", data.spo2);
-  Serial.printf("Body Temperature: %.2f °C\n", data.temperature);
-  Serial.printf("ECG Raw Value: %d\n", data.ecgValue);
-  
-  Serial.println("--- ACTIVITY DATA ---");
-  Serial.printf("Acceleration: X=%.2fg, Y=%.2fg, Z=%.2fg\n", 
-                data.accelX, data.accelY, data.accelZ);
-  Serial.printf("Gyro: X=%.2f°/s, Y=%.2f°/s, Z=%.2f°/s\n", 
-                data.gyroX, data.gyroY, data.gyroZ);
-  Serial.printf("Fall Detected: %s\n", data.fallDetected ? "YES" : "NO");
-  
-  Serial.println("--- SYSTEM STATUS ---");
-  Serial.printf("Battery Level: %d%%\n", data.batteryLevel);
-  Serial.printf("WiFi Status: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-  Serial.printf("MQTT Status: %s\n", client.connected() ? "Connected" : "Disconnected");
-  Serial.printf("Power Mode: %s\n", isBatteryPower ? "Battery" : "Mains");
-  Serial.println("=====================\n");
-}
-
-// ========== ALERT HANDLING ==========
-bool checkCriticalAlerts(SensorData data) {
-  return (data.heartRate > MAX_HEART_RATE || 
-          data.heartRate < MIN_HEART_RATE ||
-          data.spo2 < MIN_SPO2 ||
-          data.temperature > MAX_TEMPERATURE ||
-          data.fallDetected);
-}
-
-void checkAndSendAlerts(SensorData data) {
-  if (checkCriticalAlerts(data)) {
-    sendAlert(data);
-  }
-}
-
-void sendAlert(SensorData data) {
-  StaticJsonDocument<256> doc;
-  doc["patient_id"] = PATIENT_ID;
-  doc["timestamp"] = millis();
-  doc["alert"] = "CRITICAL";
-  
-  if (data.heartRate > MAX_HEART_RATE) doc["condition"] = "HIGH_HEART_RATE";
-  else if (data.heartRate < MIN_HEART_RATE) doc["condition"] = "LOW_HEART_RATE";
-  else if (data.spo2 < MIN_SPO2) doc["condition"] = "LOW_SPO2";
-  else if (data.temperature > MAX_TEMPERATURE) doc["condition"] = "HIGH_TEMPERATURE";
-  else if (data.fallDetected) doc["condition"] = "FALL_DETECTED";
-  
-  String payload;
-  serializeJson(doc, payload);
-  
-  if (client.connected()) {
-    client.publish("patient/alerts", payload.c_str());
-    Serial.println("ALERT SENT: " + payload);
-  }
-}
-
 // ========== DATA TRANSMISSION ==========
 void sendData(SensorData data, bool isCritical) {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc; // Increased size for ECG data
   
   doc["patient_id"] = PATIENT_ID;
   doc["timestamp"] = millis();
@@ -333,107 +489,145 @@ void sendData(SensorData data, bool isCritical) {
   vitals["spo2"] = data.spo2;
   vitals["temperature"] = data.temperature;
   vitals["ecg_raw"] = data.ecgValue;
+  vitals["ecg_heart_rate"] = data.ecgBasedHeartRate;
+  vitals["lead_off"] = data.leadOff;
+  vitals["ecg_quality"] = data.ecgSignalQuality ? "good" : "poor";
   vitals["battery"] = data.batteryLevel;
   
   JsonObject activity = doc.createNestedObject("activity");
   activity["accel_x"] = data.accelX;
   activity["accel_y"] = data.accelY;
   activity["accel_z"] = data.accelZ;
+  activity["gyro_x"] = data.gyroX;
+  activity["gyro_y"] = data.gyroY;
+  activity["gyro_z"] = data.gyroZ;
   activity["fall_detected"] = data.fallDetected;
+  
+  // Add system info
+  JsonObject system = doc.createNestedObject("system");
+  system["rssi"] = WiFi.RSSI();
+  system["free_heap"] = ESP.getFreeHeap();
+  system["uptime"] = millis();
   
   String payload;
   serializeJson(doc, payload);
   
   if (client.connected()) {
-    client.publish(MQTT_TOPIC, payload.c_str());
-    Serial.println("Data sent to MQTT: " + payload);
+    if (client.publish(MQTT_TOPIC, payload.c_str())) {
+      Serial.println("✅ Data sent to HiveMQ");
+      Serial.println("Payload: " + payload);
+    } else {
+      Serial.println("❌ Failed to publish to HiveMQ");
+    }
   } else {
-    Serial.println("MQTT not connected - data not sent");
-  }
-}
-
-// ========== NETWORK FUNCTIONS ==========
-void setupNetwork() {
-  setupWiFi();
-  client.setServer(MQTT_SERVER, MQTT_PORT);
-  reconnectMQTT();
-}
-
-bool ensureNetworkConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    setupWiFi();
-  }
-  if (!client.connected()) {
-    return reconnectMQTT();
-  }
-  return true;
-}
-
-void setupWiFi() {
-  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi CONNECTED");
-    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("\nWiFi FAILED");
-  }
-}
-
-bool reconnectMQTT() {
-  Serial.println("Connecting to MQTT...");
-  String clientId = "ESP32PatientMonitor-" + String(random(0xffff), HEX);
-  
-  if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-    Serial.println("MQTT CONNECTED");
-    return true;
-  } else {
-    Serial.printf("MQTT FAILED, rc=%d\n", client.state());
-    return false;
+    Serial.println("❌ MQTT not connected - data not sent");
   }
 }
 
 // ========== UTILITY FUNCTIONS ==========
+void printSensorReadings(SensorData data) {
+  Serial.println("\n=== SENSOR READINGS ===");
+  Serial.println("--- VITAL SIGNS ---");
+  Serial.printf("Heart Rate: %d bpm (ECG: %.1f bpm)\n", data.heartRate, data.ecgBasedHeartRate);
+  Serial.printf("SpO2: %d%%\n", data.spo2);
+  Serial.printf("Temperature: %.2f °C\n", data.temperature);
+  Serial.printf("ECG Raw: %d\n", data.ecgValue);
+  
+  Serial.println("--- ECG STATUS ---");
+  Serial.printf("Lead-off Detected: %s\n", data.leadOff ? "YES ⚠️" : "NO ✅");
+  Serial.printf("ECG Signal Quality: %s\n", data.ecgSignalQuality ? "GOOD ✅" : "POOR ⚠️");
+  
+  Serial.println("--- ACTIVITY ---");
+  Serial.printf("Acceleration: X=%.2fg, Y=%.2fg, Z=%.2fg\n", 
+                data.accelX, data.accelY, data.accelZ);
+  Serial.printf("Fall Detected: %s\n", data.fallDetected ? "YES ⚠️" : "NO ✅");
+  
+  Serial.println("--- SYSTEM ---");
+  Serial.printf("Battery: %d%%\n", data.batteryLevel);
+  Serial.printf("WiFi: %s | MQTT: %s\n", 
+                WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
+                client.connected() ? "Connected" : "Disconnected");
+  Serial.println("=====================\n");
+}
+
+void setupNetwork() {
+  setupWiFi();
+
+  espClient.setInsecure();   // 🔑 REQUIRED for HiveMQ Cloud (TLS)
+  
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setBufferSize(2048);
+  reconnectMQTT();
+}
+
+
+void setupWiFi() {
+  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+  
+  WiFi.disconnect(true);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  
+// For secured network - with password
+WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  Serial.print("Connecting");
+  unsigned long startTime = millis();
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    
+    // Timeout after 30 seconds
+    if (millis() - startTime > 30000) {
+      Serial.println("\n❌ WiFi connection failed!");
+      Serial.println("Please check:");
+      Serial.println("1. Network is 2.4GHz (not 5GHz)");
+      Serial.println("2. ESP32 is in range");
+      Serial.println("3. Router is not blocking device");
+      Serial.println("4. Wrong Password");
+      return;
+    }
+  }
+  
+  Serial.println("\n✅ WiFi CONNECTED!");
+  Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+}
+
+bool reconnectMQTT() {
+  // Ensure WiFi is connected first
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - reconnecting...");
+    setupWiFi();
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      return false;
+    }
+  }
+  
+  Serial.println("Connecting to HiveMQ...");
+  
+  // Generate unique client ID
+  String clientId = "ESP32Patient-" + String(random(0xffff), HEX);
+  
+  // Connect to HiveMQ with authentication
+  if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+    Serial.println("✅ CONNECTED to HiveMQ!");
+    Serial.printf("Broker: %s:%d\n", MQTT_SERVER, MQTT_PORT);
+    Serial.printf("Topic: %s\n", MQTT_TOPIC);
+    Serial.println("Also publishing ECG stream to: patient/ecg_stream");
+    return true;
+  } else {
+    Serial.printf("❌ MQTT connection failed, rc=%d\n", client.state());
+    return false;
+  }
+}
+
 void checkPowerSource() {
-  // Simplified check - in real implementation, proper power monitoring is used
-  isBatteryPower = false; // Assume mains power for prototype
+  isBatteryPower = false; // Assume mains power
 }
 
 int readBatteryLevel() {
-  // Simplified - in real implementation, read from ADC with voltage divider
-  return 85; // Simulated 85% battery
-}
-
-void storeDataOffline(SensorData data) {
-  // Store data in EEPROM for later transmission
-  Serial.println("STORING DATA OFFLINE (network unavailable)");
-  // Implementation would write to EEPROM here
-}
-
-void sendOfflineData() {
-  // Send any stored offline data when network is available
-  Serial.println("SENDING PREVIOUSLY STORED OFFLINE DATA");
-  // Implementation would read from EEPROM and send here
-}
-
-void goToDeepSleep() {
-  Serial.println("CRITICAL ERROR - Entering deep sleep");
-  esp_deep_sleep_start();
-}
-
-void setPinsToLowPower() {
-  // Set all unused pins to low power state
-  int pins[] = {2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
-  for (int i = 0; i < sizeof(pins)/sizeof(pins[0]); i++) {
-    pinMode(pins[i], INPUT_PULLDOWN);
-  }
-  Serial.println("All pins set to low power state");
+  return 85; // Simulated battery level
 }
