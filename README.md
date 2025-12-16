@@ -1,62 +1,98 @@
-# IoT-Enabled Remote Patient Monitoring System
+IoT-Enabled Medical Device for Remote Patient Monitoring
 
-A graduate-level project demonstrating the integration of embedded systems and computer networks for affordable, scalable remote patient monitoring using ESP32 and IoT technologies.
+Project Overview
+----------------
+This project presents an IoT-enabled medical device for remote patient monitoring,
+designed to continuously collect, transmit, store, and visualize patient vital signs
+in real time. The system leverages secure MQTT communication, cloud-based data
+ingestion, time-series storage, and interactive dashboards.
 
-## Project Overview
+The primary objective is to demonstrate an end-to-end IoT healthcare monitoring
+pipeline suitable for clinical observation, telemedicine, and research applications.
 
-This system autonomously collects multiple physiological parameters from a patient, securely transmits the data over Wi-Fi using MQTT protocol, and displays real-time vitals on a cloud-based dashboard for remote clinical oversight. The project demonstrates professional embedded systems development with power management, error handling, and real-time alerting.
+System Architecture
+-------------------
+ESP32 Device
+   |
+   | (MQTT over TLS)
+   v
+HiveMQ Cloud Broker
+   |
+   v
+Telegraf (MQTT Consumer)
+   |
+   v
+InfluxDB (Time-Series Database)
+   |
+   v
+Grafana (Visualization & Monitoring)
 
-### Key Features
-- **Multi-Parameter Monitoring**: Heart rate, SpO2, body temperature, ECG, and activity/fall detection
-- **Real-time Data Transmission**: Secure MQTT over Wi-Fi with JSON payloads
-- **Intelligent Power Management**: Deep sleep modes and battery optimization
-- **Cloud Dashboard**: Real-time visualization with Grafana and InfluxDB
-- **Advanced Alert System**: Threshold-based critical condition notifications
-- **Offline Operation**: Data caching when network is unavailable
-- **Professional Codebase**: Modular, maintainable architecture with comprehensive error handling
+Monitored Parameters
+--------------------
+- ECG Heart Rate (bpm)
+- Heart Rate (bpm)
+- Battery Level (%)
+- Raw ECG Signal (optional)
 
-## System Architecture
+Technologies Used
+-----------------
+Hardware:
+- ESP32 Microcontroller
+- ECG sensor module
+- Power monitoring circuitry
 
-## Bill of Materials
+Software:
+- MQTT Protocol
+- HiveMQ Cloud
+- Telegraf
+- InfluxDB v2
+- Grafana
+- Ubuntu Linux
 
-| Component | Purpose | Cost | Source |
-|-----------|---------|------|--------|
-| Arduino Nano ESP32 | Main microcontroller | $25 | Adafruit/Amazon |
-| MAX30102 | Heart rate & SpO2 monitoring | $15 | SparkFun |
-| AD8232 | Single-lead ECG monitoring | $20 | SparkFun |
-| MLX90614 | Non-contact body temperature | $15 | Adafruit |
-| MPU6050 | Accelerometer & gyroscope | $3 | Amazon |
-| LiPo Battery (1000mAh) | Portable power | $8 | Amazon |
-| TP4056 Charger Module | Battery management | $2 | Amazon |
-| Breadboard & Wires | Prototyping | $5 | Amazon |
+Security Features
+-----------------
+- Encrypted MQTT communication using TLS
+- Username/password authentication
+- Token-based access control for InfluxDB
+- Local-only dashboard access by default
 
-**Total Estimated Cost: ~$93**
+Data Visualization
+------------------
+Grafana dashboards provide:
+- Real-time ECG heart rate trends
+- Battery level visualization
+- Historical data analysis
+- Threshold-based alerts for abnormal values
 
-## Software Requirements
+Setup Summary
+-------------
+1. Configure ESP32 to publish sensor data via MQTT
+2. Set up HiveMQ Cloud broker with secure credentials
+3. Configure Telegraf to subscribe to MQTT topics
+4. Store data in InfluxDB bucket (patient_data)
+5. Build Grafana dashboards using Flux queries
 
-### Arduino IDE Libraries
-```cpp
-WiFi.h
-PubSubClient.h
-Wire.h
-ArduinoJson.h
-EEPROM.h
-SparkFun MAX3010x Pulse and Proximity Sensor Library
-SparkFun Bio Sensor Hub Library
-Adafruit MLX90614 Library
-MPU6050 by Electronic Cats
+Applications
+------------
+- Remote patient monitoring
+- Telemedicine systems
+- Medical research
+- IoT healthcare education
+- Wearable healthcare devices
 
-ESP32 Pin    Sensor Connection
---------    ------------------
-3.3V        → ALL: VCC/VIN
-GND         → ALL: GND
-GPIO 4      → ALL: SDA (I2C)
-GPIO 5      → ALL: SCL (I2C)
-GPIO 12     → MAX32664: RES_PIN
-GPIO 13     → MAX32664: MFIO_PIN
-GPIO 14 (A0)→ AD8232: OUTPUT
-GPIO 15 (A1)→ AD8232: LO+
-GPIO 16 (A2)→ AD8232: LO-
+Future Enhancements
+-------------------
+- Multi-patient support
+- Automated alert notifications
+- Long-term ECG waveform storage
+- Cloud deployment
+- Mobile application integration
 
-LiPo Battery → TP4056 Charger → ESP32 3.3V
-USB Power    →    Module     → System Load
+Disclaimer
+----------
+This project is intended for educational and research purposes only and is not
+certified for clinical or diagnostic use.
+
+Author
+------
+Project Name: IoT-Enabled Medical Device for Remote Patient Monitoring
