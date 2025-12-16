@@ -3,9 +3,13 @@ sudo apt update
 sudo apt install mosquitto mosquitto-clients
 sudo systemctl enable mosquitto
 
-# Install Node-RED
-bash <(curl -sL https://raw.githubusercontent.com/node-red/linux-installers/master/deb/update-nodejs-and-nodered)
-sudo systemctl enable nodered
+# Install Telegraf
+wget -qO- https://repos.influxdata.com/influxdata-archive.key | sudo apt-key add -
+echo "deb https://repos.influxdata.com/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/influxdata.list
+sudo apt install telegraf
+sudo nano /etc/telegraf/telegraf.conf
+sudo systemctl start telegraf
+sudo systemctl enable telegraf
 
 # Install InfluxDB
 wget -q https://repos.influxdata.com/influxdata-archive.key
