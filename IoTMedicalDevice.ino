@@ -8,13 +8,12 @@
 // Sensor libraries
 #include <MAX30105.h>
 #include <heartRate.h>
-#include <spo2_algorithm.h>
-#include <Adafruit_MLX90614.h>
-#include <MPU6050.h>
+#include "Adafruit_MLX90614.h"
+#include "MPU6050.h"
 
 // ========== CONFIGURATION ==========
-const char* WIFI_SSID = "Taffy";  // Network name
-const char* WIFI_PASSWORD = "TaffyBillions";  //Network password
+const char* WIFI_SSID = "Taffy";
+const char* WIFI_PASSWORD = "TaffyBillions";
 
 // HiveMQ Configuration
 const char* MQTT_SERVER = "a5ef99d0bdcd45feb91d4bd3881df6de.s1.eu.hivemq.cloud";
@@ -25,23 +24,46 @@ const char* MQTT_TOPIC = "patient/vitals";
 const char* PATIENT_ID = "patient_001";
 
 // AD8232 ECG Configuration
-#define ECG_PIN 34          // ECG signal output (ADC1_CH6)
-#define LO_PLUS_PIN 35      // Lead-off detection positive (ADC1_CH7)
-#define LO_MINUS_PIN 32     // Lead-off detection negative (ADC1_CH4)
-#define SDN_PIN 25          // Shutdown control (optional)
+#define ECG_PIN 34
+#define LO_PLUS_PIN 35
+#define LO_MINUS_PIN 32
+#define SDN_PIN 25
 
-// ECG parameters
-#define ECG_BUFFER_SIZE 250 // Buffer for 1 second of data at 250Hz
-#define HEART_RATE_SAMPLES 10 // Number of samples for HR calculation
-const unsigned long ECG_SEND_INTERVAL = 1000; // Send ECG data every 1 second
+// 🔔 ALERT SYSTEM CONFIGURATION - ADDED
+#define LED_GREEN 5    // GPIO5 - Green LED (Normal)
+#define LED_ORANGE 18   // GPIO18 - Orange LED (Warning)
+#define LED_RED 19      // GPIO19 - Red LED (Critical)
+#define BUZZER_PIN 23   // GPIO23 - Buzzer
 
-const unsigned long SEND_INTERVAL = 5000; // 5 seconds for vitals
-
-// Alert thresholds
+// Alert thresholds - ENHANCED WITH WARNING LEVELS
 const int MAX_HEART_RATE = 120;
 const int MIN_HEART_RATE = 50;
+const int WARNING_MAX_HR = 110;    // Warning threshold
+const int WARNING_MIN_HR = 55;     // Warning threshold
+
 const int MIN_SPO2 = 90;
+const int WARNING_MIN_SPO2 = 92;   // Warning threshold
+
 const float MAX_TEMPERATURE = 38.0;
+const float WARNING_MAX_TEMP = 37.9; // Warning threshold
+
+// Alert states - ADDED
+enum AlertState {
+  ALERT_NORMAL,      // Green LED
+  ALERT_WARNING,     // Orange LED
+  ALERT_CRITICAL     // Red LED + Buzzer
+};
+
+AlertState currentAlert = ALERT_NORMAL;
+unsigned long lastAlertChange = 0;
+bool buzzerActive = false;
+unsigned long buzzerStartTime = 0;
+
+// ECG parameters
+#define ECG_BUFFER_SIZE 250
+#define HEART_RATE_SAMPLES 10
+const unsigned long ECG_SEND_INTERVAL = 1000;
+const unsigned long SEND_INTERVAL = 5000;
 
 // ========== SENSOR OBJECTS ==========
 MAX30105 particleSensor;
@@ -53,7 +75,6 @@ WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // ========== GLOBAL VARIABLES ==========
-// MAX30102 variables
 #define BUFFER_SIZE 100
 uint32_t irBuffer[BUFFER_SIZE];
 uint32_t redBuffer[BUFFER_SIZE];
@@ -73,7 +94,6 @@ int ecgIndex = 0;
 unsigned long lastEcgSend = 0;
 bool leadOffDetected = false;
 bool ecgQualityGood = true;
-int calculatedHeartRate = 72; // ECG-based heart rate
 int heartRateSamples[HEART_RATE_SAMPLES];
 int hrSampleIndex = 0;
 unsigned long lastPeakTime = 0;
@@ -96,84 +116,133 @@ struct SensorData {
 unsigned long lastSendTime = 0;
 bool isBatteryPower = false;
 
-// ========== SETUP ==========
-void setup() {
-  Serial.begin(115200);
-  delay(2000); // Give serial time to initialize
+// 🔔 ALERT SYSTEM FUNCTIONS - MOVED TO TOP (BEFORE setup())
+void initializeAlertSystem() {
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_ORANGE, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
   
-  Serial.println("\n=== REMOTE PATIENT MONITORING SYSTEM ===");
-  Serial.println("Initializing...");
+  // Turn off all LEDs initially
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_ORANGE, LOW);
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
   
-  // Initialize EEPROM
-  EEPROM.begin(512);
-  
-  // Initialize AD8232 pins
-  initializeECGSensor();
-  
-  // Check power source
-  checkPowerSource();
-  
-  // Initialize sensors
-  if (!initializeSensors()) {
-    Serial.println("CRITICAL: Sensor initialization failed!");
-    // Continue in degraded mode
-  }
-  
-  // Connect to network
-  setupNetwork();
-  
-  Serial.println("=== SYSTEM INITIALIZATION COMPLETE ===");
-  Serial.printf("Device ID: %s\n", PATIENT_ID);
-  Serial.printf("Send Interval: %d ms\n", SEND_INTERVAL);
-  Serial.println("AD8232 ECG Ready - Checking electrode connections...");
-  checkElectrodeConnection();
-  Serial.println("======================================\n");
-  
-  lastSendTime = millis();
-  lastEcgSend = millis();
+  Serial.println("Alert system initialized");
+  Serial.println("LED Pins: Green=GPIO5, Orange=GPIO18, Red=GPIO19, Buzzer=GPIO23");
 }
 
-// ========== MAIN LOOP ==========
-void loop() {
-  // Maintain MQTT connection
-  if (!client.connected()) {
-    reconnectMQTT();
-  }
-  client.loop();
-  
-  // Continuously read and process ECG data
-  readECGData();
-  
-  // Send ECG data stream (more frequent - every 1 second)
-  if (millis() - lastEcgSend > ECG_SEND_INTERVAL) {
-    sendECGData();
-    lastEcgSend = millis();
-  }
-  
-  // Regular vital signs transmission (every 5 seconds)
-  if (millis() - lastSendTime > SEND_INTERVAL) {
-    SensorData data = readAllSensors();
+void setAlert(AlertState newAlert, String reason = "") {  // Changed to String
+  if (currentAlert != newAlert) {
+    currentAlert = newAlert;
+    lastAlertChange = millis();
     
-    // Print readings for monitoring
-    printSensorReadings(data);
+    // Turn off all LEDs first
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_ORANGE, LOW);
+    digitalWrite(LED_RED, LOW);
     
-    // Send to HiveMQ
-    sendData(data, false);
-    
-    lastSendTime = millis();
+    // Activate appropriate LED
+    switch (newAlert) {
+      case ALERT_NORMAL:
+        digitalWrite(LED_GREEN, HIGH);
+        Serial.println("✅ Alert: NORMAL - " + reason);
+        break;
+      case ALERT_WARNING:
+        digitalWrite(LED_ORANGE, HIGH);
+        Serial.println("⚠️ Alert: WARNING - " + reason);
+        break;
+      case ALERT_CRITICAL:
+        digitalWrite(LED_RED, HIGH);
+        buzzerActive = true;
+        buzzerStartTime = millis();
+        Serial.println("🚨 Alert: CRITICAL - " + reason);
+        break;
+    }
   }
-  
-  delay(10); // 100Hz loop for ECG sampling
 }
 
-// ========== AD8232 ECG FUNCTIONS ==========
+void checkAndUpdateAlerts(SensorData data) {
+  // CRITICAL CONDITIONS (Red LED + Buzzer)
+  if (data.fallDetected) {
+    setAlert(ALERT_CRITICAL, "FALL DETECTED!");
+    return;
+  }
+  
+  if (data.heartRate >= MAX_HEART_RATE || data.heartRate <= MIN_HEART_RATE) {
+    setAlert(ALERT_CRITICAL, "Heart Rate CRITICAL: " + String(data.heartRate) + " bpm");
+    return;
+  }
+  
+  if (data.spo2 < MIN_SPO2) {
+    setAlert(ALERT_CRITICAL, "SpO2 CRITICAL: " + String(data.spo2) + "%");
+    return;
+  }
+  
+  if (data.temperature >= MAX_TEMPERATURE) {
+    setAlert(ALERT_CRITICAL, "Temperature CRITICAL: " + String(data.temperature) + "°C");
+    return;
+  }
+  
+  if (data.leadOff) {
+    setAlert(ALERT_WARNING, "Electrodes DISCONNECTED!");
+    return;
+  }
+  
+  // WARNING CONDITIONS (Orange LED)
+  if (data.heartRate >= WARNING_MAX_HR || data.heartRate <= WARNING_MIN_HR) {
+    setAlert(ALERT_WARNING, "Heart Rate warning: " + String(data.heartRate) + " bpm");
+    return;
+  }
+  
+  if (data.spo2 < WARNING_MIN_SPO2) {
+    setAlert(ALERT_WARNING, "SpO2 warning: " + String(data.spo2) + "%");
+    return;
+  }
+  
+  if (data.temperature >= WARNING_MAX_TEMP) {
+    setAlert(ALERT_WARNING, "Temperature warning: " + String(data.temperature) + "°C");
+    return;
+  }
+  
+  if (!data.ecgSignalQuality) {
+    setAlert(ALERT_WARNING, "Poor ECG signal quality");
+    return;
+  }
+  
+  // NORMAL CONDITIONS (Green LED)
+  setAlert(ALERT_NORMAL, "All vitals normal");
+}
+
+void manageBuzzer() {
+  if (!buzzerActive) return;
+  
+  // Pulsing pattern for critical alerts: 500ms ON, 500ms OFF
+  unsigned long currentTime = millis();
+  unsigned long elapsed = currentTime - buzzerStartTime;
+  
+  if (elapsed % 1000 < 500) {
+    digitalWrite(BUZZER_PIN, HIGH);  // Buzzer ON
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);   // Buzzer OFF
+  }
+  
+  // Stop buzzer if alert is no longer critical
+  if (currentAlert != ALERT_CRITICAL) {
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// ========== ECG FUNCTIONS ==========
 void initializeECGSensor() {
   Serial.println("Initializing AD8232 ECG Sensor...");
   
   // Configure pins
   pinMode(ECG_PIN, INPUT);
-  pinMode(LO_PLUS_PIN, INPUT_PULLUP);  // Enable pull-up for LO detection
-  pinMode(LO_MINUS_PIN, INPUT_PULLUP); // Enable pull-up for LO detection
+  pinMode(LO_PLUS_PIN, INPUT);  //
+  pinMode(LO_MINUS_PIN, INPUT); // 
   pinMode(SDN_PIN, OUTPUT);
   
   // Start with AD8232 ON (SDN = LOW)
@@ -358,12 +427,9 @@ void setECGSensorPower(bool powerOn) {
 bool initializeSensors() {
   Serial.println("Initializing sensors...");
   
-  // Initialize I2C
-  Wire.begin(21, 22);
-  delay(100);
   
   // Initialize MAX30102
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
     Serial.println("MAX30102 not found - continuing without it");
   } else {
     byte ledBrightness = 0x1F;
@@ -476,13 +542,66 @@ SensorData readAllSensors() {
   return data;
 }
 
-// ========== DATA TRANSMISSION ==========
+// ========== UTILITY FUNCTIONS ==========
+void checkPowerSource() {
+  isBatteryPower = false; // Assume mains power
+}
+
+int readBatteryLevel() {
+  return 85; // Simulated battery level
+}
+
+// 🎚️ ENHANCED PRINT FUNCTION WITH ALERT STATUS - MODIFIED
+void printSensorReadings(SensorData data) {
+  Serial.println("\n=== SENSOR READINGS ===");
+  Serial.println("--- VITAL SIGNS ---");
+  Serial.printf("Heart Rate: %d bpm (ECG: %.1f bpm)\n", data.heartRate, data.ecgBasedHeartRate);
+  Serial.printf("SpO2: %d%%\n", data.spo2);
+  Serial.printf("Temperature: %.2f °C\n", data.temperature);
+  Serial.printf("ECG Raw: %d\n", data.ecgValue);
+  
+  Serial.println("--- ECG STATUS ---");
+  Serial.printf("Lead-off Detected: %s\n", data.leadOff ? "YES ⚠️" : "NO ✅");
+  Serial.printf("ECG Signal Quality: %s\n", data.ecgSignalQuality ? "GOOD ✅" : "POOR ⚠️");
+  
+  Serial.println("--- ACTIVITY ---");
+  Serial.printf("Acceleration: X=%.2fg, Y=%.2fg, Z=%.2fg\n", 
+                data.accelX, data.accelY, data.accelZ);
+  Serial.printf("Fall Detected: %s\n", data.fallDetected ? "YES ⚠️" : "NO ✅");
+  
+  // 🔔 ADDED ALERT STATUS DISPLAY
+  Serial.println("--- ALERT SYSTEM ---");
+  switch (currentAlert) {
+    case ALERT_NORMAL:
+      Serial.println("Status: 🟢 NORMAL (Green LED ON)");
+      break;
+    case ALERT_WARNING:
+      Serial.println("Status: 🟠 WARNING (Orange LED ON)");
+      break;
+    case ALERT_CRITICAL:
+      Serial.println("Status: 🔴 CRITICAL (Red LED ON + Buzzer)");
+      break;
+  }
+  
+  Serial.println("--- SYSTEM ---");
+  Serial.printf("Battery: %d%%\n", data.batteryLevel);
+  Serial.printf("WiFi: %s | MQTT: %s\n", 
+                WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
+                client.connected() ? "Connected" : "Disconnected");
+  Serial.println("=====================\n");
+}
+
+// 📤 ENHANCED DATA TRANSMISSION WITH ALERT STATUS - MODIFIED
 void sendData(SensorData data, bool isCritical) {
-  StaticJsonDocument<768> doc; // Increased size for ECG data
+  StaticJsonDocument<768> doc;
   
   doc["patient_id"] = PATIENT_ID;
   doc["timestamp"] = millis();
   doc["critical"] = isCritical;
+  
+  // 🔔 ADD ALERT LEVEL TO JSON
+  doc["alert_level"] = (currentAlert == ALERT_NORMAL) ? "normal" : 
+                      (currentAlert == ALERT_WARNING) ? "warning" : "critical";
   
   JsonObject vitals = doc.createNestedObject("vitals");
   vitals["heart_rate"] = data.heartRate;
@@ -503,7 +622,6 @@ void sendData(SensorData data, bool isCritical) {
   activity["gyro_z"] = data.gyroZ;
   activity["fall_detected"] = data.fallDetected;
   
-  // Add system info
   JsonObject system = doc.createNestedObject("system");
   system["rssi"] = WiFi.RSSI();
   system["free_heap"] = ESP.getFreeHeap();
@@ -524,32 +642,7 @@ void sendData(SensorData data, bool isCritical) {
   }
 }
 
-// ========== UTILITY FUNCTIONS ==========
-void printSensorReadings(SensorData data) {
-  Serial.println("\n=== SENSOR READINGS ===");
-  Serial.println("--- VITAL SIGNS ---");
-  Serial.printf("Heart Rate: %d bpm (ECG: %.1f bpm)\n", data.heartRate, data.ecgBasedHeartRate);
-  Serial.printf("SpO2: %d%%\n", data.spo2);
-  Serial.printf("Temperature: %.2f °C\n", data.temperature);
-  Serial.printf("ECG Raw: %d\n", data.ecgValue);
-  
-  Serial.println("--- ECG STATUS ---");
-  Serial.printf("Lead-off Detected: %s\n", data.leadOff ? "YES ⚠️" : "NO ✅");
-  Serial.printf("ECG Signal Quality: %s\n", data.ecgSignalQuality ? "GOOD ✅" : "POOR ⚠️");
-  
-  Serial.println("--- ACTIVITY ---");
-  Serial.printf("Acceleration: X=%.2fg, Y=%.2fg, Z=%.2fg\n", 
-                data.accelX, data.accelY, data.accelZ);
-  Serial.printf("Fall Detected: %s\n", data.fallDetected ? "YES ⚠️" : "NO ✅");
-  
-  Serial.println("--- SYSTEM ---");
-  Serial.printf("Battery: %d%%\n", data.batteryLevel);
-  Serial.printf("WiFi: %s | MQTT: %s\n", 
-                WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
-                client.connected() ? "Connected" : "Disconnected");
-  Serial.println("=====================\n");
-}
-
+// ========== NETWORK FUNCTIONS ==========
 void setupNetwork() {
   setupWiFi();
 
@@ -560,7 +653,6 @@ void setupNetwork() {
   reconnectMQTT();
 }
 
-
 void setupWiFi() {
   Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
   
@@ -568,8 +660,7 @@ void setupWiFi() {
   delay(1000);
   WiFi.mode(WIFI_STA);
   
-// For secured network - with password
-WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
   Serial.print("Connecting");
   unsigned long startTime = millis();
@@ -624,10 +715,87 @@ bool reconnectMQTT() {
   }
 }
 
-void checkPowerSource() {
-  isBatteryPower = false; // Assume mains power
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+   // Initialize I2C
+   Wire.begin(21, 22);
+  Wire.setClock(100000);   // 100 kHz for stability
+  delay(100);
+  
+  Serial.println("\n=== REMOTE PATIENT MONITORING SYSTEM ===");
+  Serial.println("Initializing...");
+  
+  // 🔔 INITIALIZE ALERT SYSTEM - ADDED
+  initializeAlertSystem();
+  
+  // Initialize EEPROM
+  EEPROM.begin(512);
+  
+  // Initialize AD8232 pins
+  initializeECGSensor();
+  
+  // Check power source
+  checkPowerSource();
+  
+  // Initialize sensors
+  if (!initializeSensors()) {
+    Serial.println("CRITICAL: Sensor initialization failed!");
+    // Show red alert for sensor failure
+    setAlert(ALERT_CRITICAL, "Sensor initialization failed");
+  }
+  
+  // Connect to network
+  setupNetwork();
+  
+  Serial.println("=== SYSTEM INITIALIZATION COMPLETE ===");
+  Serial.printf("Device ID: %s\n", PATIENT_ID);
+  Serial.printf("Send Interval: %d ms\n", SEND_INTERVAL);
+  Serial.println("AD8232 ECG Ready - Checking electrode connections...");
+  checkElectrodeConnection();
+  Serial.println("======================================\n");
+  
+  lastSendTime = millis();
+  lastEcgSend = millis();
 }
 
-int readBatteryLevel() {
-  return 85; // Simulated battery level
+// ========== MAIN LOOP ==========
+void loop() {
+  // Maintain MQTT connection
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+  
+  // Continuously read and process ECG data
+  readECGData();
+  
+  // Send ECG data stream
+  if (millis() - lastEcgSend > ECG_SEND_INTERVAL) {
+    sendECGData();
+    lastEcgSend = millis();
+  }
+  
+  // Regular vital signs transmission
+  if (millis() - lastSendTime > SEND_INTERVAL) {
+    SensorData data = readAllSensors();
+    
+    // 🔔 CHECK ALERTS AND UPDATE LEDS - ADDED
+    checkAndUpdateAlerts(data);
+    
+    // Print readings for monitoring
+    printSensorReadings(data);
+    
+    // Send to HiveMQ
+    sendData(data, (currentAlert == ALERT_CRITICAL));
+    
+    lastSendTime = millis();
+  }
+  
+  // 🔔 MANAGE BUZZER (PULSING FOR CRITICAL ALERTS) - ADDED
+  manageBuzzer();
+  
+  delay(10);
 }
